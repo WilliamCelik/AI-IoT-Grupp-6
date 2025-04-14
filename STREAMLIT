@@ -1,0 +1,146 @@
+import streamlit as st  
+import boto3
+import uuid
+import re
+import base64
+import requests
+
+# 🔧 AWS Lex config: Replace the placeholders below with your own AWS Lex Bot settings
+LEX_BOT_ID = "YOUR_LEX_BOT_ID"
+LEX_BOT_ALIAS_ID = "YOUR_LEX_ALIAS_ID"
+AWS_REGION = "YOUR_REGION"  # t.ex. "eu-central-1"
+IDENTIFY_API_URL = "https://your-api-gateway-url.amazonaws.com/prod/identify"
+
+# 🧐 Session
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = str(uuid.uuid4())
+
+# 🧠 Lex client
+lex_client = boto3.client("lexv2-runtime", region_name=AWS_REGION)
+
+# 🎨 UI-style
+st.markdown("""
+    <style>
+        .chat-bubble {
+            padding: 1rem;
+            border-radius: 1rem;
+            margin: 0.5rem 0;
+            max-width: 85%;
+        }
+        .user-bubble {
+            background-color: #2c2f33;
+            color: white;
+            align-self: flex-end;
+        }
+        .bot-bubble {
+            background-color: #40444b;
+            color: white;
+            align-self: flex-start;
+        }
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+        }
+        .stButton>button {
+            background-color: #1f77b4;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 0.5rem 1rem;
+            margin-top: 0.5rem;
+        }
+        a {
+            color: #1f77b4;
+            text-decoration: underline;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+# 🗒 Titel och instruktion
+st.title("💬 Väderannika🌞")
+st.subheader("Din personliga väderassistent som också kan allt om ogräs och ogräsbekämpning")
+
+if st.button("🗑️ Rensa konversation"):
+    st.session_state.messages = []
+    st.session_state.uploaded_file = None
+    st.session_state.uploader_key = str(uuid.uuid4())
+    try:
+        lex_client.delete_session(
+            botId=LEX_BOT_ID,
+            botAliasId=LEX_BOT_ALIAS_ID,
+            localeId=LEX_LOCALE_ID,
+            sessionId=st.session_state.session_id
+        )
+    except lex_client.exceptions.ResourceNotFoundException:
+        pass
+    st.rerun()
+
+# 📸 Interaktiv: Ladda upp en bild på ogräs
+with st.expander("📷 Klicka här för att identifiera ogräs från bild"):
+    uploaded_file = st.file_uploader("Välj en bild (JPG/JPEG)", type=["jpg", "jpeg"], key=st.session_state.uploader_key)
+    if uploaded_file:
+        st.session_state.uploaded_file = uploaded_file
+
+    if st.session_state.get("uploaded_file"):
+        st.image(st.session_state.uploaded_file, caption="⬆️ Din uppladdade bild", use_container_width=True)
+        if st.button("🔎 Identifiera ogräset"):
+            with st.spinner("🔍 Analyserar bilden..."):
+                img_bytes = st.session_state.uploaded_file.read()
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                response = requests.post(
+                    IDENTIFY_API_URL,
+                    data=img_b64,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+                if response.status_code == 200:
+                    result = response.json().get("result", "Inget resultat mottaget.")
+                    st.session_state.messages.append(("Väderannika", result))
+                else:
+                    st.session_state.messages.append(("Väderannika", f"Något gick fel vid bildanalysen: {response.text}"))
+            st.rerun()
+
+# ✍️ Input (nu överst)
+with st.form("chat_form", clear_on_submit=True):
+    user_input = st.text_input("Skriv här...", placeholder="Vad vill du veta om väder och ogrässituationen?")
+    submitted = st.form_submit_button("Skicka")
+
+# 📨 Skicka till Lex
+if submitted and user_input:
+    st.session_state.messages.append(("Du", user_input))
+    with st.spinner("⏳ Väderannika tänker..."):
+        try:
+            response = lex_client.recognize_text(
+                botId=LEX_BOT_ID,
+                botAliasId=LEX_BOT_ALIAS_ID,
+                localeId=LEX_LOCALE_ID,
+                sessionId=st.session_state.session_id,
+                text=user_input,
+            )
+            lex_message = (
+                response["messages"][0]["content"]
+                if "messages" in response and response["messages"]
+                else "Inget svar från Väderannika 🧠"
+            )
+            st.session_state.messages.append(("Väderannika", lex_message))
+        except Exception as e:
+            st.session_state.messages.append(("Väderannika", f"Något gick fel: {e}"))
+    st.rerun()
+
+# 📌 Visa chatt (senaste meddelanden först)
+for sender, message in reversed(st.session_state.messages):
+    if sender == "Du":
+        st.markdown(
+            f"""<div class="chat-container"><div class="chat-bubble user-bubble">🫋 <strong>{sender}:</strong><br>{message}</div></div>""",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"""<div class="chat-container"><div class="chat-bubble bot-bubble">🤖 <strong>{sender}:</strong><br>{message}</div></div>""",
+            unsafe_allow_html=True
+        )
