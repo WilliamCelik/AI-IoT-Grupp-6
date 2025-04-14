@@ -1,0 +1,585 @@
+# NOTE:
+# - Secrets, API keys, and bucket names have been redacted or replaced.
+# - DO NOT commit sensitive AWS identifiers, API keys, or ARNs to public repositories.
+
+import json
+import urllib3
+import logging
+import boto3
+
+# Setup
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+http = urllib3.PoolManager()
+s3 = boto3.client('s3')
+BUCKET_NAME = "YOUR_BUCKET_NAME"  # Masked for public sharing
+
+# Entry point
+def lambda_handler(event, context):
+    try:
+        logger.debug('Received event: %s', json.dumps(event))
+    except Exception:
+        logger.debug("Received event (could not encode full content due to Unicode).")
+
+    if "sessionState" in event:
+        return handle_lex_request(event)
+    elif "httpMethod" in event:
+        return handle_api_gateway_request(event)
+    else:
+        return generate_lex_response("Invalid request source", fulfillment_state="Failed")
+
+# Main Lex logic
+def handle_lex_request(event):
+    try:
+        intent_name = event.get('sessionState', {}).get('intent', {}).get('name')
+        logger.info(f"Intent name received: {intent_name}")
+    except Exception as e:
+        logger.error("Failed to extract intent name.")
+        raise e
+
+    if intent_name == "Getweedinfo":
+        try:
+            weed_slot = (
+                event.get('sessionState', {})
+                     .get('intent', {})
+                     .get('slots', {})
+                     .get('Weedname', {})
+                     .get('value', {})
+                     .get('interpretedValue')
+            )
+
+            logger.info(f"Weedname slot received: {weed_slot}")
+
+            if not weed_slot:
+                logger.warning("Slot 'Weedname' was not filled or interpreted.")
+                return generate_lex_error_response("Getweedinfo", "Jag kunde inte tolka växtnamnet.")
+
+            return handle_weed_request(weed_slot)
+
+        except Exception as e:
+            logger.exception("Error in Getweedinfo intent.")
+            return generate_lex_error_response("Getweedinfo", "Fel uppstod vid hämtning av växtinformation.")
+    elif intent_name == "GetHerbicideInfo":
+        try:
+            weed_slot = (
+                event.get('sessionState', {})
+                     .get('intent', {})
+                     .get('slots', {})
+                     .get('Weedname', {})
+                     .get('value', {})
+                     .get('interpretedValue')
+            )
+
+            logger.info(f"Weedname slot received for herbicide info: {weed_slot}")
+
+            if not weed_slot:
+                return generate_lex_error_response("GetHerbicideInfo", "Jag kunde inte tolka växtnamnet.")
+
+            return handle_herbicide_info_request(weed_slot)
+
+        except Exception:
+            logger.exception("Error handling GetHerbicideInfo intent")
+            return generate_lex_error_response("GetHerbicideInfo", "Ett fel inträffade vid hämtning av bekämpningsinfo.")
+
+    elif intent_name == "Weatherinfo":
+        try:
+            slots = event['sessionState']['intent']['slots']
+            city = slots.get("City", {}).get("value", {}).get("interpretedValue")
+            date = slots.get("Date", {}).get("value", {}).get("interpretedValue")
+            locale = event["bot"]["localeId"]
+
+            logger.info(f"City: {city}, Date: {date}, Locale: {locale}")
+
+            # Kontrollera att båda värden finns
+            if not city or not date:
+                return generate_lex_error_response("Weatherinfo", "Jag kunde inte tolka ort eller datum korrekt.")
+
+            lon, lat = get_coordinates(city)
+            if lon is None or lat is None:
+                logger.warning(f"Kunde inte hitta koordinater för orten '{city}'")
+                return generate_lex_error_response("Weatherinfo", f"Kunde inte hitta väderdata för orten '{city}'. Kontrollera stavningen.")
+
+            weather_data = fetch_weather_data(lon, lat, date)
+            if weather_data is None:
+                logger.warning(f"Ingen väderdata tillgänglig för {city} den {date}")
+                return generate_lex_error_response("Weatherinfo", f"Ingen väderprognos tillgänglig för {city} den {date}")
+
+            session_attributes = {
+                "last_city": city,
+                "last_date": date
+            }
+
+            return generate_lex_response(weather_data, city, date, locale, session_attributes)
+
+        except Exception:
+            logger.exception("Error handling Weatherinfo intent")
+            return generate_lex_error_response("Weatherinfo", "Något gick fel när väderdata skulle hämtas.")
+
+    elif intent_name == "Music":
+        return {
+            "sessionState": {
+                "dialogAction": {"type": "Close"},
+                "intent": {"name": "Music", "state": "Fulfilled"}
+            },
+            "messages": [{
+                "contentType": "CustomPayload",
+                "content": "🎶 Jag kan sjunga! Här är min sång! Hoppas du gillar den:\n\n[🎵 VäderAnnika sjunger](https://www.youtube.com/watch?v=dwCs3rmnymM)"
+            }]
+        }
+        
+
+    elif intent_name == "FindBestSprayDay":
+        try:
+            slots = event['sessionState']['intent']['slots']
+            city = slots.get("City", {}).get("value", {}).get("interpretedValue")
+            if not city:
+                return generate_lex_error_response("FindBestSprayDay", "Jag behöver veta vilken ort du menar.")
+
+            next_date, explanation = find_next_spray_day(city)
+            if next_date:
+                message = (
+                    f"\n\n 📆 Nästa dag med bra bekämpningsförhållanden i {city} är {next_date}.  \n\n"
+                    f"{explanation.replace('\n', '  \n')}"
+                )
+            else:
+                message = f"🚫 Inga bra bekämpningsdagar hittades i {city} de närmaste 10 dagarna."
+
+            return {
+                "sessionState": {
+                    "dialogAction": {"type": "Close"},
+                    "intent": {"name": "FindBestSprayDay", "state": "Fulfilled"}
+                },
+                "messages": [{"contentType": "PlainText", "content": message}]
+            }
+
+        except Exception:
+            logger.exception("Fel vid sökning efter bästa bekämpningsdag")
+            return generate_lex_error_response("FindBestSprayDay", "Något gick fel när vi försökte hitta bästa bekämpningsdag.")
+
+
+    elif intent_name == "CheckSprayConditions":
+        try:
+            slots = event.get('sessionState', {}).get('intent', {}).get('slots') or {}
+            session_attributes = event['sessionState'].get('sessionAttributes', {})
+
+            city = (slots.get('City') or {}).get('value', {}).get('interpretedValue') or session_attributes.get("last_city")
+            date = (slots.get('Date') or {}).get('value', {}).get('interpretedValue') or session_attributes.get("last_date")
+
+            locale = event["bot"]["localeId"]
+
+            if not city or not date:
+                return generate_lex_error_response("CheckSprayConditions", "Jag saknar information om ort eller datum.")
+
+            lon, lat = get_coordinates(city)
+            if lon is None or lat is None:
+                logger.warning(f"Kunde inte hitta koordinater för orten '{city}'")
+                return generate_lex_error_response("CheckSprayConditions", f"Jag kunde inte hitta platsen '{city}'. Kontrollera stavningen.")
+
+            weather_data = fetch_weather_data(lon, lat, date)
+            if weather_data is None:
+                logger.warning(f"Ingen väderdata tillgänglig för {city} den {date}")
+                return generate_lex_error_response("CheckSprayConditions", f"Ingen väderdata tillgänglig för {city} den {date}. Prova ett annat datum.")
+
+            spray_ok, analysis = evaluate_spray_conditions(weather_data)
+
+            message = (
+                f"\n\n🧪 Bedömning för bekämpning i {city} den {date}:\n\n"
+                f"{analysis.replace('\n', '  \n')}"
+            )
+
+            return {
+                "sessionState": {
+                    "dialogAction": {"type": "Close"},
+                    "intent": {"name": "CheckSprayConditions", "state": "Fulfilled"}
+                },
+                "messages": [{"contentType": "PlainText", "content": message}]
+            }
+
+        except Exception:
+            logger.exception("Error handling CheckSprayConditions intent")
+            return generate_lex_response(None, "okänd plats", "okänt datum", "sv_SE")
+
+def handle_weed_request(weed_name):
+    try:
+        logger.info(f"Försöker hämta ogräsdata för: {weed_name}")
+        # Försök med flera namnvarianter
+        name_variants = [
+            weed_name,
+            weed_name.capitalize(),
+            weed_name.upper()
+        ]
+
+        for name in name_variants:
+            try:
+                key = f"OgräsDB/Data/{name}.json"
+                response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+                weed_data = json.loads(response['Body'].read())
+
+                image_path = weed_data.get('Bild', f"OgräsDB/Images/{name}.jpg")
+                image_url = f"https://{BUCKET_NAME}.s3.eu-central-1.amazonaws.com/{image_path}"
+
+                message = (
+                    f"\n\n🌿 Här är informationen om {weed_data['Ogräsnamn']} från jordbruksverkets ogräsdatabas:  \n\n"
+                    f"\n\nLatinskt namn: {weed_data.get('Latinskt namn', 'okänt')}\n\n"
+                    f"Artbeskrivning:\n{weed_data.get('Artbeskrivning', 'Ingen beskrivning tillgänglig')}\n\n"
+                    f"Förekomst:\n{weed_data.get('Förekomst', 'Ingen information tillgänglig')}\n\n"
+                    f"Giftighet:\n{weed_data.get('Giftighet', 'Ingen information tillgänglig')}\n\n"
+                    f"Smaklighet:\n{weed_data.get('Smaklighet', 'Ingen information tillgänglig')}\n\n"
+                    f"Näringsvärde:\n{weed_data.get('Näringsvärde', 'Ingen information tillgänglig')}\n\n"
+                    f"Bild:\n{image_url}"
+                )
+
+                return {
+                    "sessionState": {
+                        "dialogAction": {"type": "Close"},
+                        "intent": {"name": "Getweedinfo", "state": "Fulfilled"}
+                    },
+                    "messages": [{"contentType": "PlainText", "content": message}]
+                }
+
+            except s3.exceptions.NoSuchKey:
+                continue  # prova nästa variant
+
+        # Om ingen variant hittades
+        logger.warning(f"Ingen ogräsfil hittades för: {weed_name}")
+        return generate_lex_error_response("Getweedinfo", f"Kunde inte hitta information om '{weed_name}'.")
+
+    except Exception as e:
+        logger.exception(f"Fel vid hämtning av ogräsdata för '{weed_name}'")
+        return generate_lex_error_response("Getweedinfo", f"Fel vid hämtning av information om '{weed_name}'.")
+
+def evaluate_spray_conditions(weather_data):
+    wind = weather_data.get("wind_speed", 999)
+    humidity = weather_data.get("humidity", 999)
+    temp = weather_data.get("temperature", -999)
+
+    status = []
+    allow = True
+
+    # Vind
+    if wind < 3:
+        status.append("✅ **Vindhastighet:** Spridning godkänd.\n")
+    elif 3 <= wind <= 5:
+        status.append("⚠️ **Vindhastighet:** Begränsad spridning möjlig vid låg luftfuktighet.\n")
+    else:
+        status.append("❌ **Vindhastighet:** För hög. Endast mekanisk bekämpning möjlig.\n")
+        allow = False
+
+    # Luftfuktighet
+    if humidity < 40:
+        status.append("❌ **Luftfuktighet:** För låg → risk för avdunstning.\n")
+        allow = False
+    elif 40 <= humidity <= 80:
+        status.append("✅ **Luftfuktighet:** Inom optimalt intervall.\n")
+    else:
+        status.append("❌ **Luftfuktighet:** För hög → risk för avrinning.\n")
+        allow = False
+
+    # Temperatur
+    if temp < 5:
+        status.append("❌ **Temperatur:** För kallt, låg effekt.\n")
+        allow = False
+    elif 5 <= temp <= 25:
+        status.append("✅ **Temperatur:** Inom optimalt intervall.\n")
+    else:
+        status.append("❌ **Temperatur:** För varmt, risk för avdunstning.\n")
+        allow = False
+
+    # Sammanfattning
+    if allow:
+        status.append("\n✅ Sammantaget: Bekämpning är möjlig.")
+    else:
+        status.append("\n🚫 Sammantaget: Bekämpning rekommenderas inte.")
+
+    return allow, "".join(status)
+
+from datetime import datetime, timedelta
+
+def find_next_spray_day(city):
+    lon, lat = get_coordinates(city)
+    if lon is None or lat is None:
+        return None, f"Kunde inte hitta koordinater för orten '{city}'."
+
+    for i in range(10):  # Kolla 10 dagar framåt
+        date = (datetime.utcnow() + timedelta(days=i)).date().isoformat()
+        weather = fetch_weather_data(lon, lat, date)
+        if weather:
+            ok, analysis = evaluate_spray_conditions(weather)
+            if ok:
+                return date, analysis
+
+    return None, ""
+   
+
+def handle_herbicide_info_request(weed_name):
+    try:
+        logger.info(f"Försöker hämta bekämpningsdata för: {weed_name}")
+        name_variants = [weed_name, weed_name.capitalize(), weed_name.upper()]
+
+        for name in name_variants:
+            try:
+                key = f"OgräsDB/Data/{name}_bekämpning.json"
+                response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+                treatment_data = json.loads(response['Body'].read())
+
+                # 🧪 Extra debug
+                logger.info(f"Behandlingsdata: {json.dumps(treatment_data, ensure_ascii=False)}")
+
+                # Hämta länkar
+                links = treatment_data.get("Länkar", {})
+                kemi_link = links.get("KemI", None)
+                producer_link = links.get("Producent", None)
+
+                message = (
+                    f"\n\n🧴Bekämpningsinfo för {weed_name} från jordbruksverkets ogräsdatabas  \n\n"
+                    f"\n\n Medel: {treatment_data.get('Namn', 'ingen info')}\n\n"
+                    f" Verkansgrad: {treatment_data.get('Verkansgrad', 'ingen info')}\n\n"
+                    f" Behandlingstidpunkt: {treatment_data.get('Behandlingstidpunkt', 'ingen info')}\n\n"
+                    f" Diverse: {treatment_data.get('Diverse', 'ingen info')}\n\n"
+                    f"🔗 **Länkar:**\n"
+                )
+            
+                if kemi_link:
+                    message += f"- [KemI]({kemi_link})\n"
+                else:
+                    message += "- KemI: Ingen länk tillgänglig\n"
+
+                if producer_link:
+                    message += f"- [Producent]({producer_link})\n"
+                else:
+                    message += "- Producent: Ingen länk tillgänglig\n"
+
+                return {
+                    "sessionState": {
+                        "dialogAction": {"type": "Close"},
+                        "intent": {"name": "GetHerbicideInfo", "state": "Fulfilled"}
+                    },
+                    "messages": [
+                        {
+                            "contentType": "PlainText",
+                            "content": message
+                        }
+                    ]
+                }
+
+            except s3.exceptions.NoSuchKey:
+                continue
+
+        return generate_lex_error_response("GetHerbicideInfo", f"Kunde inte hitta bekämpningsinfo för '{weed_name}'.")
+
+    except Exception as e:
+        logger.exception(f"Fel vid hämtning av bekämpningsdata för '{weed_name}'")
+        return generate_lex_error_response("GetHerbicideInfo", f"Fel vid hämtning av bekämpningsinfo för '{weed_name}'.")
+
+# Lex response builder for errors
+def generate_lex_error_response(intent_name, message):
+    return {
+        "sessionState": {
+            "dialogAction": {"type": "Close"},
+            "intent": {"name": intent_name, "state": "Failed"}
+        },
+        "messages": [{"contentType": "PlainText", "content": message}]
+    }
+
+# API Gateway fallback handler
+def handle_api_gateway_request(event):
+    method = event.get("httpMethod", "").upper()
+
+    if method == "OPTIONS":
+        return {
+            "statusCode": 200,
+            "headers": cors_headers(),
+            "body": json.dumps({"message": "CORS preflight successful"})
+        }
+
+    elif method == "POST" and event.get("path") == "/identify":
+        return handle_image_identification(event)
+
+    elif method == "POST":
+        body = json.loads(event['body'])
+        city = body.get("City")
+        date = body.get("Date")
+        return process_weather_request(city, date)
+
+    return {
+        "statusCode": 405,
+        "headers": cors_headers(),
+        "body": json.dumps({"error": "Method Not Allowed"})
+    }
+
+# For manual API Gateway weather requests
+def process_weather_request(city, date):
+    lon, lat = get_coordinates(city)
+    if lon is None or lat is None:
+        return {"statusCode": 400, "body": json.dumps({"error": f"Could not find coordinates for {city}"})}
+
+    weather_data = fetch_weather_data(lon, lat, date)
+    if weather_data is None:
+        return {"statusCode": 404, "body": json.dumps({"error": f"No weather data available for {city} on {date}"})}
+
+    return {"statusCode": 200, "body": json.dumps({"message": f"Weather forecast for {city} on {date}: {weather_data}"})}
+
+# Lex response builder for weather
+from datetime import datetime  # Se till att detta redan finns överst i ditt script
+
+def generate_lex_response(weather_data, city, date, locale="en_US", session_attributes=None):
+    time_iso = weather_data.get('time') if weather_data else None
+    formatted_time = ""
+    if time_iso:
+        dt = datetime.fromisoformat(time_iso.replace("Z", "+00:00"))
+        formatted_time = dt.strftime("kl %H:%M UTC")
+
+    messages = {
+        "en_US": {
+            "no_data": f"Sorry, I couldn't retrieve weather data for {city} on {date}.",
+            "forecast": (
+                f"Weather forecast for {city} on {date} ({formatted_time}):\n\n"
+                f"Temperature: {weather_data.get('temperature', 'N/A')}°C\n\n"
+                f"Rainfall: {weather_data.get('rainfall', 'N/A')} mm\n\n"
+                f"Wind Speed: {weather_data.get('wind_speed', 'N/A')} m/s\n\n"
+                f"Humidity: {weather_data.get('humidity', 'N/A')}%\n"
+            ),
+            "closing": "Would you like to check the weather for another location or day?"
+        },
+        "sv_SE": {
+            "no_data": f"Tyvärr kunde jag inte hämta väderdata för {city} den {date}.",
+            "forecast": (
+                f"\n\n🌍 Väderprognos för {city} {date} ({formatted_time})\n\n"
+                f"🌡️ Temperatur:\n{weather_data.get('temperature', 'N/A')}°C\n\n"
+                f"🌧️ Nederbörd:\n{weather_data.get('rainfall', 'N/A')} mm\n\n"
+                f"💨 Vindhastighet:\n{weather_data.get('wind_speed', 'N/A')} m/s\n\n"
+                f"💧 Luftfuktighet:\n{weather_data.get('humidity', 'N/A')}%\n\n"
+                f"🌫️ Molntäcke:\n{weather_data.get('cloud_cover', 'N/A')}%\n\n"
+                f"🧭 Vindriktning:\n{weather_data.get('wind_direction', 'N/A')}°\n\n"
+                f"🌬️ Byvind:\n{weather_data.get('gust_speed', 'N/A')} m/s"
+            ),
+            "closing": "Vill du kolla vädret för någon annan plats eller dag?"
+        }
+    }
+
+    lang = messages.get(locale, messages["en_US"])
+
+    if not weather_data:
+        return {
+            "sessionState": {
+                "dialogAction": {"type": "Close"},
+                "intent": {"name": "Weatherinfo", "state": "Failed"}
+            },
+            "messages": [{"contentType": "PlainText", "content": lang["no_data"]}]
+        }
+
+    return {
+        "sessionState": {
+            "dialogAction": {"type": "Close"},
+            "intent": {"name": "Weatherinfo", "state": "Fulfilled"},
+            "sessionAttributes": session_attributes or {}
+        },
+        "messages": [
+            {"contentType": "PlainText", "content": lang["forecast"]},
+            {"contentType": "PlainText", "content": lang["closing"]}
+        ]
+    }
+
+
+
+# Geocoding
+def get_coordinates(city):
+    api_key = 'YOUR_OPENCAGE_API_KEY'  # Masked
+    url = f"https://api.opencagedata.com/geocode/v1/json?q={city}&key={api_key}"
+    response = http.request('GET', url)
+    if response.status == 200:
+        data = json.loads(response.data.decode('utf-8'))
+        if data['results']:
+            return data['results'][0]['geometry']['lng'], data['results'][0]['geometry']['lat']
+    return None, None
+
+# Image recognition
+def handle_image_identification(event):
+    try:
+        rekognition = boto3.client('rekognition', region_name='eu-central-1')
+        project_version_arn = 'YOUR_PROJECT_VERSION_ARN'  # Masked ARN
+
+        import base64
+        image_bytes = base64.b64decode(event["body"])
+
+        response = rekognition.detect_custom_labels(
+            ProjectVersionArn=project_version_arn,
+            Image={'Bytes': image_bytes}
+        )
+
+        if not response["CustomLabels"]:
+            result = "🧐 Jag kunde inte identifiera något ogräs i bilden. Är du säker på att det är en växt?"
+            return {
+                "statusCode": 200,
+                "headers": cors_headers(),
+                "body": json.dumps({"result": result})
+            }
+        else:
+            label = response["CustomLabels"][0]["Name"]
+            confidence = round(response["CustomLabels"][0]["Confidence"], 1)
+            result = f"🌱 Det ser ut som: **{label}** ({confidence}% säkerhet)"
+            return {
+                "statusCode": 200,
+                "headers": cors_headers(),
+                "body": json.dumps({"label": label, "result": result})
+            }
+
+    except Exception as e:
+        logger.exception("Fel vid bildidentifiering")
+        return {
+            "statusCode": 500,
+            "headers": cors_headers(),
+            "body": json.dumps({"error": str(e)})
+        }
+
+# Weather API
+from datetime import datetime
+
+def fetch_weather_data(lon, lat, date):
+    logger.debug(f"Fetching weather data for lon: {lon}, lat: {lat}, date: {date}")
+    url = f"https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2/geotype/point/lon/{round(lon, 4)}/lat/{round(lat, 4)}/data.json"
+    response = http.request('GET', url)
+    logger.debug(f"API Response Status: {response.status}")
+
+    if response.status == 200:
+        forecast_data = json.loads(response.data.decode('utf-8'))
+
+        # Vi vill ha datapunkten som ligger närmast kl 10:00 UTC samma dag
+        target_hour = 10
+        closest_entry = None
+        smallest_diff = float('inf')
+
+        for entry in forecast_data["timeSeries"]:
+            entry_time = datetime.fromisoformat(entry["validTime"].replace("Z", "+00:00"))
+            if entry_time.date().isoformat() == date:
+                diff = abs(entry_time.hour - target_hour)
+                if diff < smallest_diff:
+                    smallest_diff = diff
+                    closest_entry = entry
+
+        if closest_entry:
+            data = {param["name"]: param["values"][0] for param in closest_entry["parameters"]}
+            logger.debug(f"Selected time: {closest_entry['validTime']} for weather data.")
+            return {
+                "temperature": data.get("t"),
+                "rainfall": data.get("pmean"),
+                "wind_speed": data.get("ws"),
+                "humidity": data.get("r"),
+                "pressure": data.get("msl"),
+                "cloud_cover": data.get("tcc_mean"),
+                "wind_direction": data.get("wd"),
+                "gust_speed": data.get("gust"),
+                "time": closest_entry['validTime'] 
+            }
+
+    logger.warning("No matching forecast data found.")
+    return None
+
+
+# CORS
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "OPTIONS, GET, POST",
+        "Access-Control-Allow-Headers": "Content-Type"
+    }
